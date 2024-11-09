@@ -1,1 +1,1 @@
-from utils.cvfpscalc import CvFpsCalc
+from gesture.utils.cvfpscalc import CvFpsCalc

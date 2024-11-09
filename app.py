@@ -11,9 +11,9 @@ import cv2 as cv
 import numpy as np
 import mediapipe as mp
 
-from utils import CvFpsCalc
-from model import KeyPointClassifier
-from model import PointHistoryClassifier
+from gesture.utils import CvFpsCalc
+from gesture.model import KeyPointClassifier
+from gesture.model import PointHistoryClassifier
 
 
 def get_args():
@@ -32,85 +32,80 @@ def get_args():
                         help='min_tracking_confidence',
                         type=int,
                         default=0.5)
+    parser.add_argument("--max_num_hands",
+                        help='max_num_hands',
+                        type=int,
+                        default=1)
 
     args = parser.parse_args()
 
     return args
 
+class GestureRecognition:
+    def __init__(self):
+        # 引数解析 #################################################################
 
-def main():
-    # 引数解析 #################################################################
-    args = get_args()
+        cap_device = 0
+        cap_width = 960
+        cap_height = 540
 
-    cap_device = args.device
-    cap_width = args.width
-    cap_height = args.height
+        use_static_image_mode = True
+        min_detection_confidence = 0.7
+        min_tracking_confidence = 0.5
+        max_num_hands = 1
+        self.use_brect = True
 
-    use_static_image_mode = args.use_static_image_mode
-    min_detection_confidence = args.min_detection_confidence
-    min_tracking_confidence = args.min_tracking_confidence
+        # カメラ準備 ###############################################################
+        self.cap = cv.VideoCapture(cap_device)
+        self.cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
+        self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-    use_brect = True
+        # モデルロード #############################################################
+        mp_hands = mp.solutions.hands
+        self.hands = mp_hands.Hands(
+            static_image_mode=use_static_image_mode,
+            max_num_hands=max_num_hands,
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
 
-    # カメラ準備 ###############################################################
-    cap = cv.VideoCapture(cap_device)
-    cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
-    cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
+        self.keypoint_classifier = KeyPointClassifier()
 
-    # モデルロード #############################################################
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=use_static_image_mode,
-        max_num_hands=1,
-        min_detection_confidence=min_detection_confidence,
-        min_tracking_confidence=min_tracking_confidence,
-    )
+        self.point_history_classifier = PointHistoryClassifier()
 
-    keypoint_classifier = KeyPointClassifier()
+        # ラベル読み込み ###########################################################
+        with open('gesture/model/keypoint_classifier/keypoint_classifier_label.csv',
+                encoding='utf-8-sig') as f:
+            keypoint_classifier_labels = csv.reader(f)
+            self.keypoint_classifier_labels = [
+                row[0] for row in keypoint_classifier_labels
+            ]
+        with open(
+                'gesture/model/point_history_classifier/point_history_classifier_label.csv',
+                encoding='utf-8-sig') as f:
+            point_history_classifier_labels = csv.reader(f)
+            self.point_history_classifier_labels = [
+                row[0] for row in point_history_classifier_labels
+            ]
 
-    point_history_classifier = PointHistoryClassifier()
+        # FPS計測モジュール ########################################################
+        self.cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # ラベル読み込み ###########################################################
-    with open('model/keypoint_classifier/keypoint_classifier_label.csv',
-              encoding='utf-8-sig') as f:
-        keypoint_classifier_labels = csv.reader(f)
-        keypoint_classifier_labels = [
-            row[0] for row in keypoint_classifier_labels
-        ]
-    with open(
-            'model/point_history_classifier/point_history_classifier_label.csv',
-            encoding='utf-8-sig') as f:
-        point_history_classifier_labels = csv.reader(f)
-        point_history_classifier_labels = [
-            row[0] for row in point_history_classifier_labels
-        ]
+        # 座標履歴 #################################################################
+        self.history_length = 16
+        self.point_history = deque(maxlen=self.history_length)
 
-    # FPS計測モジュール ########################################################
-    cvFpsCalc = CvFpsCalc(buffer_len=10)
+        # フィンガージェスチャー履歴 ################################################
+        self.finger_gesture_history = deque(maxlen=self.history_length)
 
-    # 座標履歴 #################################################################
-    history_length = 16
-    point_history = deque(maxlen=history_length)
 
-    # フィンガージェスチャー履歴 ################################################
-    finger_gesture_history = deque(maxlen=history_length)
-
-    #  ########################################################################
-    mode = 0
-
-    while True:
-        fps = cvFpsCalc.get()
-
-        # キー処理(ESC：終了) #################################################
-        key = cv.waitKey(10)
-        if key == 27:  # ESC
-            break
-        number, mode = select_mode(key, mode)
+    def gesture_recognition_step(self):
+        fps = self.cvFpsCalc.get()
 
         # カメラキャプチャ #####################################################
-        ret, image = cap.read()
+        ret, image = self.cap.read()
         if not ret:
-            break
+            return
         image = cv.flip(image, 1)  # ミラー表示
         debug_image = copy.deepcopy(image)
 
@@ -118,13 +113,13 @@ def main():
         image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
         image.flags.writeable = False
-        results = hands.process(image)
+        results = self.hands.process(image)
         image.flags.writeable = True
 
         #  ####################################################################
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
-                                                  results.multi_handedness):
+                                                    results.multi_handedness):
                 # 外接矩形の計算
                 brect = calc_bounding_rect(debug_image, hand_landmarks)
                 # ランドマークの計算
@@ -134,51 +129,54 @@ def main():
                 pre_processed_landmark_list = pre_process_landmark(
                     landmark_list)
                 pre_processed_point_history_list = pre_process_point_history(
-                    debug_image, point_history)
-                # 学習データ保存
-                logging_csv(number, mode, pre_processed_landmark_list,
-                            pre_processed_point_history_list)
+                    debug_image, self.point_history)
 
                 # ハンドサイン分類
-                hand_sign_id = keypoint_classifier(pre_processed_landmark_list)
+                hand_sign_id = self.keypoint_classifier(pre_processed_landmark_list)
                 if hand_sign_id == 2:  # 指差しサイン
-                    point_history.append(landmark_list[8])  # 人差指座標
+                    self.point_history.append(landmark_list[8])  # 人差指座標
                 else:
-                    point_history.append([0, 0])
+                    self.point_history.append([0, 0])
 
                 # フィンガージェスチャー分類
                 finger_gesture_id = 0
                 point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (history_length * 2):
-                    finger_gesture_id = point_history_classifier(
+                if point_history_len == (self.history_length * 2):
+                    finger_gesture_id = self.point_history_classifier(
                         pre_processed_point_history_list)
 
                 # 直近検出の中で最多のジェスチャーIDを算出
-                finger_gesture_history.append(finger_gesture_id)
+                self.finger_gesture_history.append(finger_gesture_id)
                 most_common_fg_id = Counter(
-                    finger_gesture_history).most_common()
+                    self.finger_gesture_history).most_common()
 
                 # 描画
-                debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+                debug_image = draw_bounding_rect(self.use_brect, debug_image, brect)
                 debug_image = draw_landmarks(debug_image, landmark_list)
                 debug_image = draw_info_text(
                     debug_image,
                     brect,
                     handedness,
-                    keypoint_classifier_labels[hand_sign_id],
-                    point_history_classifier_labels[most_common_fg_id[0][0]],
+                    self.keypoint_classifier_labels[hand_sign_id],
+                    self.point_history_classifier_labels[most_common_fg_id[0][0]],
                 )
         else:
-            point_history.append([0, 0])
+            self.point_history.append([0, 0])
 
-        debug_image = draw_point_history(debug_image, point_history)
-        debug_image = draw_info(debug_image, fps, mode, number)
+        debug_image = draw_point_history(debug_image, self.point_history)
+        debug_image = draw_info(debug_image, fps)
 
         # 画面反映 #############################################################
         cv.imshow('Hand Gesture Recognition', debug_image)
 
-    cap.release()
-    cv.destroyAllWindows()
+        if results.multi_hand_landmarks is not None:
+            return self.keypoint_classifier_labels[hand_sign_id]
+        else:
+            return None
+
+    def release(self):
+        self.cap.release()
+        cv.destroyAllWindows()
 
 
 def select_mode(key, mode):
@@ -522,23 +520,13 @@ def draw_point_history(image, point_history):
     return image
 
 
-def draw_info(image, fps, mode, number):
+def draw_info(image, fps):
     cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
                1.0, (0, 0, 0), 4, cv.LINE_AA)
     cv.putText(image, "FPS:" + str(fps), (10, 30), cv.FONT_HERSHEY_SIMPLEX,
                1.0, (255, 255, 255), 2, cv.LINE_AA)
-
-    mode_string = ['Logging Key Point', 'Logging Point History']
-    if 1 <= mode <= 2:
-        cv.putText(image, "MODE:" + mode_string[mode - 1], (10, 90),
-                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                   cv.LINE_AA)
-        if 0 <= number <= 9:
-            cv.putText(image, "NUM:" + str(number), (10, 110),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
-                       cv.LINE_AA)
     return image
 
 
 if __name__ == '__main__':
-    main()
+    gesture_recognition()
